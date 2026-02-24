@@ -1,0 +1,36 @@
+# Secrets
+.env
+
+# Krisp auth state
+krisp/.krisp_state/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+*.log
+logs/
+
+# Audio & processed output (user data)
+meetings/
+*.m4a
+*.mp3
+*.wav
+*.aac
+*.mov
+*_transcription.txt
+*_summary.md
+
+# State files
+.krisp_downloaded_auto.txt
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
