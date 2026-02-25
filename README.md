@@ -34,13 +34,41 @@ meetings/
 
 ## A few things worth noting
 
-Transcription is local (faster-whisper, int8). No audio goes anywhere. Runs on an M1 Air 8 GB with the `medium` model.
+Transcription runs via faster-whisper (int8). By default it's local — runs on an M1 Air 8 GB with the `medium` model. If you have a server, you can offload it there (see below).
 
 Krisp saves recordings as hex UUIDs. Turns out these are UUIDv7 — first 48 bits encode a Unix timestamp in milliseconds. The pipeline extracts the time, queries CalDAV for a matching event (±15 min window), and renames the file to `YYMMDD_EventTitle_krispID.ext`.
 
-Diarization is MFCC + k-means, no GPU needed. Works okay for 2-4 people if the audio quality is reasonable.
+Diarization is MFCC + agglomerative clustering (cosine distance), no GPU needed. Works okay for 2-4 people if the audio quality is reasonable.
 
 Action items go two places: YouTrack (as subtasks of existing issues, with the summary posted as a comment) and a local Markdown file (for offline).
+
+## Remote transcription
+
+If you don't want whisper eating your laptop's CPU, you can offload transcription to any Linux server with SSH access.
+
+**What moves to the server:** only the whisper + diarization step. Everything else (Krisp download, calendar lookup, Claude summarization, YouTrack/inbox integration) stays local. Audio files are uploaded temporarily and deleted after transcription.
+
+**Deploy the worker** (one time):
+
+```bash
+./remote/deploy.sh root@your-server
+```
+
+This installs Python, ffmpeg, faster-whisper, and copies the worker script to `/opt/call-processing/` on the server.
+
+**Enable in `.env`:**
+
+```env
+TRANSCRIBE_REMOTE=true
+REMOTE_HOST=your-server-ip
+REMOTE_USER=root
+```
+
+That's it. `process.py` will now scp audio to the server, transcribe there, pull the result back, and clean up. All output files still land in your local `MEETINGS_DIR` as usual.
+
+To update the worker after a code change: `./remote/deploy.sh root@your-server --update`
+
+**Requirements:** SSH access with key-based auth (password auth not supported). The server needs ~3 GB RAM for the `medium` model. No GPU needed.
 
 ## Setup
 
@@ -66,6 +94,11 @@ All in `.env`, see `.env.example`. Short version:
 | `CALDAV_URL`, `_USERNAME`, `_PASSWORD`, `_CALENDAR_NAME` | Calendar for renaming | Yes |
 | `WHISPER_MODEL_SIZE` | `tiny`/`base`/`small`/`medium`/`large` | No (`medium`) |
 | `LANGUAGE` | ISO 639-1 | No (`ru`) |
+| `TRANSCRIBE_REMOTE` | Offload whisper to a server | No (`false`) |
+| `REMOTE_HOST`, `_USER` | SSH target for remote mode | If remote |
+| `SCHEDULE_MODE` | `window` (interval in time range) or `daily` | No (`window`) |
+| `SCHEDULE_WINDOW` / `_INTERVAL` | Active hours + check frequency | No (`12:00-23:30` / `120`) |
+| `SCHEDULE_TIME` | Daily run time (daily mode only) | No (`23:00`) |
 | `YOUTRACK_ENABLED`, `_URL`, `_TOKEN`, `_PROJECT` | Task tracker | No |
 | `INBOX_ENABLED`, `_FILE` | Markdown kanban path | No |
 | `KRISP_EMAIL` | Auto-downloader | No |

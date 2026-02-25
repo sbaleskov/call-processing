@@ -1,5 +1,9 @@
 """
-Audio transcription via local faster-whisper with optional speaker diarization (MFCC + clustering).
+Audio transcription — local faster-whisper or remote server via SSH.
+
+Mode is controlled by TRANSCRIBE_REMOTE in .env:
+  false (default) → runs whisper locally
+  true            → offloads to a remote server (see pipeline/transcribe_remote.py)
 """
 
 import logging
@@ -163,15 +167,20 @@ def _estimate_num_speakers(X: np.ndarray, max_speakers: int = 6) -> int:
 
 def transcribe_audio(file_path: str, config) -> Optional[str]:
     """
+    Transcribe an audio file to text.
+
+    Routes to local whisper or remote server based on config.transcribe_remote.
+    """
+    if getattr(config, "transcribe_remote", False):
+        from pipeline.transcribe_remote import transcribe_audio_remote
+        return transcribe_audio_remote(file_path, config)
+    return _transcribe_audio_local(file_path, config)
+
+
+def _transcribe_audio_local(file_path: str, config) -> Optional[str]:
+    """
     Transcribe an audio file to text via local faster-whisper.
     If diarization is enabled, speaker labels are added.
-
-    Args:
-        file_path: Path to the audio file
-        config: Configuration object
-
-    Returns:
-        Text transcription or None on error
     """
     try:
         file_path_obj = Path(file_path)
