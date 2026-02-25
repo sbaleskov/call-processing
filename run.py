@@ -35,6 +35,7 @@ class ProcessManager:
 
     def __init__(self):
         self.processes: List[subprocess.Popen] = []
+        self._log_handles = []
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
@@ -48,6 +49,7 @@ class ProcessManager:
         if log_file:
             log_file.parent.mkdir(parents=True, exist_ok=True)
             log_handle = open(log_file, "a")
+            self._log_handles.append(log_handle)
         else:
             log_handle = subprocess.DEVNULL
 
@@ -62,7 +64,7 @@ class ProcessManager:
         return proc
 
     def stop_all(self):
-        """Stop all processes."""
+        """Stop all processes and close log file handles."""
         for proc in self.processes:
             if proc.poll() is None:
                 proc.terminate()
@@ -70,6 +72,9 @@ class ProcessManager:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+        for handle in self._log_handles:
+            handle.close()
+        self._log_handles.clear()
         logger.info("All processes stopped")
 
     def wait_all(self):

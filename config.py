@@ -66,6 +66,22 @@ class Config:
         self.inbox_file: str = os.getenv("INBOX_FILE", "")
         self.inbox_enabled: bool = os.getenv("INBOX_ENABLED", "false").lower() == "true"
 
+        # Remote transcription (offload whisper to a server via SSH)
+        self.transcribe_remote: bool = os.getenv("TRANSCRIBE_REMOTE", "false").lower() == "true"
+        self.remote_host: str = os.getenv("REMOTE_HOST", "")
+        self.remote_user: str = os.getenv("REMOTE_USER", "root")
+        self.remote_ssh_key: str = os.getenv("REMOTE_SSH_KEY", "")
+        self.remote_worker_dir: str = os.getenv("REMOTE_WORKER_DIR", "/opt/call-processing")
+        self.remote_work_dir: str = os.getenv("REMOTE_WORK_DIR", "/tmp/call-processing")
+
+        # Processing schedule
+        # window = check every N minutes within a time window
+        # daily  = single run at a fixed time each day
+        self.schedule_mode: str = os.getenv("SCHEDULE_MODE", "window")
+        self.schedule_window: str = os.getenv("SCHEDULE_WINDOW", "12:00-23:30")
+        self.schedule_interval: int = int(os.getenv("SCHEDULE_INTERVAL", "120"))
+        self.schedule_time: str = os.getenv("SCHEDULE_TIME", "23:00")
+
         # Krisp settings
         self.krisp_email: str = os.getenv("KRISP_EMAIL", "")
         self.krisp_check_interval: int = int(os.getenv("KRISP_CHECK_INTERVAL", "300"))
