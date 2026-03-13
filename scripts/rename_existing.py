@@ -71,10 +71,15 @@ def parse_krisp_filename(name: str) -> dict | None:
         date_match = re.search(r'(?:meeting|Discord)\s+(\w+)\s+(\d{1,2})', krisp_title, re.IGNORECASE)
         if date_match:
             month_name, day = date_match.group(1), int(date_match.group(2))
-            try:
-                meeting_date = datetime.strptime(f"{month_name} {day} {year}", "%B %d %Y").date()
-            except ValueError:
-                pass
+            today = date.today()
+            for try_year in [year, year - 1]:
+                try:
+                    parsed = datetime.strptime(f"{month_name} {day} {try_year}", "%B %d %Y").date()
+                    if parsed <= today:
+                        meeting_date = parsed
+                        break
+                except ValueError:
+                    continue
 
         if not meeting_date:
             meeting_date = datetime.strptime(download_date, "%Y-%m-%d").date()

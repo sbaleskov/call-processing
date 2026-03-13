@@ -49,6 +49,9 @@ class Config:
         # Speaker diarization
         self.diarize: bool = os.getenv("DIARIZE", "true").lower() == "true"
         self.num_speakers: int = int(os.getenv("NUM_SPEAKERS", "0"))
+        self.diarize_backend: str = os.getenv("DIARIZE_BACKEND", "auto")
+        self.hf_token: str = os.getenv("HF_TOKEN", "")
+        self.vad_filter: bool = os.getenv("VAD_FILTER", "true").lower() == "true"
 
         # CalDAV calendar
         self.caldav_url: str = os.getenv("CALDAV_URL", "")

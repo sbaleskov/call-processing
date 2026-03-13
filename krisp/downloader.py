@@ -152,6 +152,16 @@ class KrispAutoDownloader:
                     return datetime.strptime(card_date.replace(",", "").strip(), fmt.replace(",", "")).date()
                 except ValueError:
                     continue
+            # Without year: "Feb 25", "February 25" — append current year
+            year = date.today().year
+            for fmt in ("%b %d %Y", "%B %d %Y"):
+                try:
+                    result = datetime.strptime(f"{card_date.strip()} {year}", fmt).date()
+                    if result > date.today():
+                        result = result.replace(year=year - 1)
+                    return result
+                except ValueError:
+                    continue
             date_match = re.search(r'(\d{4})-(\d{2})-(\d{2})', card_date)
             if date_match:
                 return date(int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3)))
@@ -164,7 +174,10 @@ class KrispAutoDownloader:
                 year = date.today().year
                 for fmt in ("%B %d %Y", "%b %d %Y"):
                     try:
-                        return datetime.strptime(f"{month_name} {day} {year}", fmt).date()
+                        parsed = datetime.strptime(f"{month_name} {day} {year}", fmt).date()
+                        if parsed > date.today():
+                            parsed = parsed.replace(year=year - 1)
+                        return parsed
                     except ValueError:
                         continue
 
@@ -231,7 +244,7 @@ class KrispAutoDownloader:
                 logger.warning("Auth failed: redirect to %s", url)
                 return False
             # Check if recording list is present on page (sign of successful login)
-            cards = page.locator("p:has-text('meeting')")
+            cards = page.locator("a.meeting-item")
             if cards.count() > 0:
                 logger.info("Auth successful, recordings on page: %d", cards.count())
                 return True
@@ -259,17 +272,15 @@ class KrispAutoDownloader:
         """
         try:
             page.goto("https://app.krisp.ai/meeting-notes", wait_until="domcontentloaded", timeout=30000)
-            # Wait for recording list to appear (various content: meeting, Discord, zoom, etc.)
+            # Wait for recording list to appear
             try:
-                page.wait_for_selector("p:has-text('meeting')", timeout=20000)
+                page.wait_for_selector("a.meeting-item", timeout=20000)
             except Exception:
                 pass
             time.sleep(3)
 
-            # Recordings: titles in <p> elements with 'meeting' text
-            cards_locator = page.locator(
-                "p:has-text('meeting')"
-            )
+            # Recordings: <a class="meeting-item"> elements
+            cards_locator = page.locator("a.meeting-item")
             n_cards = cards_locator.count()
             if n_cards == 0:
                 logger.info("No recordings found on page")
@@ -284,35 +295,37 @@ class KrispAutoDownloader:
                     # Each iteration: re-open list for fresh DOM (otherwise DOM goes stale)
                     page.goto("https://app.krisp.ai/meeting-notes", wait_until="domcontentloaded", timeout=30000)
                     try:
-                        page.wait_for_selector("p:has-text('meeting')", timeout=15000)
+                        page.wait_for_selector("a.meeting-item", timeout=15000)
                     except Exception:
                         pass
                     time.sleep(2)
 
-                    cards_locator = page.locator(
-                        "p:has-text('meeting')"
-                    )
+                    cards_locator = page.locator("a.meeting-item")
                     if cards_locator.count() <= i:
                         break
                     recording_cards = cards_locator.all()
                     card = recording_cards[i]
 
-                    # Extract recording title from card BEFORE click
+                    # Extract recording title and date from card BEFORE click
                     card_title = None
                     card_date = None
                     try:
-                        card_title = card.text_content()
-                        if card_title:
-                            card_title = card_title.strip()
-                        # Try to find date near the card
-                        parent = card.locator('xpath=ancestor::div[1]')
-                        if parent.count() > 0:
-                            parent_text = parent.text_content()
-                            if parent_text:
-                                # Search for date format "Feb 7, 2026" or "7 Feb 2026" etc.
-                                date_match = re.search(r'(\w{3,9}\s+\d{1,2},?\s+\d{4})', parent_text)
-                                if date_match:
-                                    card_date = date_match.group(1)
+                        # Title is in the first <p> inside <a.meeting-item>
+                        title_p = card.locator("p").first
+                        if title_p.count() > 0:
+                            card_title = title_p.text_content()
+                            if card_title:
+                                card_title = card_title.strip()
+                        # Fallback: full text of <a> element
+                        if not card_title:
+                            card_title = card.text_content()
+                            if card_title:
+                                card_title = card_title.strip()
+                        # Date is typically at the end of the <a> text (e.g. "Feb 27")
+                        full_text = card.text_content() or ""
+                        date_match = re.search(r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})', full_text)
+                        if date_match:
+                            card_date = date_match.group(1)
                     except Exception as e:
                         logger.debug(f"Failed to extract from card: {e}")
 

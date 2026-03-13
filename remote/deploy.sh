@@ -31,7 +31,8 @@ if [ "$UPDATE_ONLY" != "--update" ]; then
 
     echo ">>> Installing Python packages..."
     ssh "$TARGET" "$INSTALL_DIR/venv/bin/pip install -q --upgrade pip && \
-        $INSTALL_DIR/venv/bin/pip install -q faster-whisper numpy soundfile python-speech-features scikit-learn"
+        $INSTALL_DIR/venv/bin/pip install -q torch torchaudio --index-url https://download.pytorch.org/whl/cpu && \
+        $INSTALL_DIR/venv/bin/pip install -q faster-whisper numpy soundfile python-speech-features scikit-learn pyannote.audio"
 fi
 
 echo ">>> Deploying worker.py..."

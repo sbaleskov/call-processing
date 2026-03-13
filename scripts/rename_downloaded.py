@@ -86,12 +86,15 @@ def parse_crisp_title(title: str) -> dict:
         if date_match:
             month_name = date_match.group(1)
             day = int(date_match.group(2))
-            for year in [2026, 2025]:
+            today = date.today()
+            for year in [today.year, today.year - 1]:
                 try:
-                    result["meeting_date"] = datetime.strptime(
+                    parsed = datetime.strptime(
                         f"{month_name} {day} {year}", "%B %d %Y"
                     ).date()
-                    break
+                    if parsed <= today:
+                        result["meeting_date"] = parsed
+                        break
                 except ValueError:
                     continue
 

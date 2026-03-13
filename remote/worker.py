@@ -47,9 +47,11 @@ def get_model(model_size, device, compute_type, threads):
     return _model_cache[key]
 
 
-def transcribe(file_path, model_size, device, compute_type, threads, language):
+def transcribe(file_path, model_size, device, compute_type, threads, language, vad_filter=True):
     model = get_model(model_size, device, compute_type, threads)
-    segments_iter, info = model.transcribe(file_path, language=language, beam_size=5)
+    segments_iter, info = model.transcribe(
+        file_path, language=language, beam_size=5, vad_filter=vad_filter,
+    )
 
     segments = []
     count = 0
@@ -153,6 +155,116 @@ def merge_speaker_segments(segments):
 
 
 # ---------------------------------------------------------------------------
+# Speaker diarization — pyannote backend
+# ---------------------------------------------------------------------------
+
+_pyannote_cache = {}
+
+
+def get_pyannote_pipeline(hf_token):
+    """Load and cache pyannote speaker-diarization-community-1."""
+    if not hf_token:
+        raise RuntimeError("HF_TOKEN is required for pyannote diarization.")
+
+    if hf_token in _pyannote_cache:
+        return _pyannote_cache[hf_token]
+
+    from pyannote.audio import Pipeline
+    import torch
+
+    logger.info("Loading pyannote speaker-diarization-community-1...")
+    pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-community-1",
+        token=hf_token,
+    )
+    pipeline.to(torch.device("cpu"))
+
+    _pyannote_cache[hf_token] = pipeline
+    logger.info("pyannote pipeline loaded")
+    return pipeline
+
+
+def diarize_pyannote(file_path, segments, hf_token, num_speakers=0):
+    """Assign speaker labels using pyannote diarization."""
+    pipeline = get_pyannote_pipeline(hf_token)
+
+    logger.info("Running pyannote diarization...")
+
+    kwargs = {}
+    if num_speakers > 0:
+        kwargs["num_speakers"] = num_speakers
+    else:
+        kwargs["min_speakers"] = 1
+        kwargs["max_speakers"] = 10
+
+    raw_result = pipeline(file_path, **kwargs)
+
+    # pyannote 4.x returns DiarizeOutput; extract Annotation object
+    result = getattr(raw_result, "speaker_diarization", raw_result)
+
+    turns = []
+    for turn, _, label in result.itertracks(yield_label=True):
+        turns.append({"start": turn.start, "end": turn.end, "speaker": label})
+
+    logger.info("pyannote found %d speaker turns", len(turns))
+
+    if not turns:
+        logger.warning("pyannote returned no turns, assigning all to Speaker 1")
+        for seg in segments:
+            seg["speaker"] = 1
+        return segments
+
+    # Map labels to ints by order of first appearance
+    seen = {}
+    counter = 1
+    for t in turns:
+        if t["speaker"] not in seen:
+            seen[t["speaker"]] = counter
+            counter += 1
+
+    # Assign dominant speaker to each Whisper segment
+    for seg in segments:
+        seg_start, seg_end = seg["start"], seg["end"]
+        if seg_end - seg_start <= 0:
+            seg["speaker"] = 1
+            continue
+
+        overlap = {}
+        for t in turns:
+            o = min(seg_end, t["end"]) - max(seg_start, t["start"])
+            if o > 0:
+                overlap[t["speaker"]] = overlap.get(t["speaker"], 0.0) + o
+
+        if overlap:
+            seg["speaker"] = seen[max(overlap, key=overlap.get)]
+        else:
+            mid = (seg_start + seg_end) / 2
+            nearest = min(turns, key=lambda t: abs((t["start"] + t["end"]) / 2 - mid))
+            seg["speaker"] = seen[nearest["speaker"]]
+
+    return segments
+
+
+def run_diarization(file_path, segments, backend, hf_token, num_speakers):
+    """Route to pyannote or MFCC diarization."""
+    use_pyannote = False
+    if backend == "pyannote":
+        use_pyannote = True
+    elif backend == "auto":
+        use_pyannote = bool(hf_token)
+
+    if use_pyannote:
+        try:
+            return diarize_pyannote(file_path, segments, hf_token, num_speakers)
+        except Exception as e:
+            logger.warning("pyannote failed, falling back to MFCC: %s", e)
+
+    # MFCC fallback
+    audio, sr = load_audio(file_path)
+    return diarize(segments, audio, sr, num_speakers)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -178,6 +290,10 @@ def main():
     parser.add_argument("--language", default="ru", help="ISO 639-1 language code")
     parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization")
     parser.add_argument("--num-speakers", type=int, default=0, help="Number of speakers (0=auto)")
+    parser.add_argument("--diarize-backend", default="auto", help="auto | pyannote | mfcc")
+    parser.add_argument("--hf-token", default="", help="HuggingFace token for pyannote")
+    parser.add_argument("--vad-filter", action="store_true", default=True, help="Enable VAD filter")
+    parser.add_argument("--no-vad-filter", action="store_false", dest="vad_filter")
     parser.add_argument("--check", action="store_true", help="Verify installation and exit")
     args = parser.parse_args()
 
@@ -195,7 +311,7 @@ def main():
     # Transcribe
     segments = transcribe(
         str(input_path), args.model, args.device, args.compute_type,
-        args.threads, args.language,
+        args.threads, args.language, vad_filter=args.vad_filter,
     )
 
     if not segments:
@@ -204,8 +320,10 @@ def main():
     elif args.diarize:
         logger.info("Running diarization...")
         try:
-            audio, sr = load_audio(str(input_path))
-            segments = diarize(segments, audio, sr, args.num_speakers)
+            segments = run_diarization(
+                str(input_path), segments,
+                args.diarize_backend, args.hf_token, args.num_speakers,
+            )
             merged = merge_speaker_segments(segments)
             result = "\n".join(f"Speaker {s['speaker']}: {s['text']}" for s in merged)
         except Exception as e:

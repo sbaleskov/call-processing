@@ -20,14 +20,15 @@ def krisp_id_to_datetime(krisp_id: str) -> Optional[datetime]:
     """
     hex_str = krisp_id.replace("-", "")
     if len(hex_str) < 12:
-        hex_str = hex_str + "0" * (12 - len(hex_str))
+        return None  # Short IDs produce garbage timestamps when padded
 
     try:
         ts_ms = int(hex_str[:12], 16)
         local_tz = datetime.now(timezone.utc).astimezone().tzinfo
         dt_utc = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
         dt_local = dt_utc.astimezone(local_tz)
-        if 2024 <= dt_local.year <= 2027:
+        now = datetime.now(local_tz)
+        if 2024 <= dt_local.year and dt_local <= now:
             return dt_local
     except (ValueError, OSError, OverflowError):
         pass

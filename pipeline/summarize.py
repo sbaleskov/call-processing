@@ -6,6 +6,8 @@ Uses Claude CLI (claude -p) to invoke LLM without a separate API key.
 import json
 import logging
 import subprocess
+import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -40,25 +42,37 @@ def summarize_transcription(
 
     prompt = _create_summarization_prompt(transcription, parent_tasks)
 
-    logger.info("Sending transcription to Claude CLI for summarization...")
+    max_retries = 2
+    for attempt in range(1, max_retries + 1):
+        logger.info("Sending transcription to Claude CLI (attempt %d/%d)...", attempt, max_retries)
+        try:
+            result_text = _call_claude(prompt)
+            if not result_text:
+                logger.error("Empty response from Claude CLI")
+                if attempt < max_retries:
+                    time.sleep(30)
+                    continue
+                return None
 
-    try:
-        result_text = _call_claude(prompt)
-        if not result_text:
-            logger.error("Empty response from Claude CLI")
+            result_text = _extract_json(result_text)
+            result = json.loads(result_text)
+            return _normalize_summary_result(result)
+
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse JSON from Claude (attempt %d): %s", attempt, e)
+            logger.debug("Claude response:\n%s", result_text)
+            if attempt < max_retries:
+                time.sleep(30)
+                continue
+            return None
+        except Exception as e:
+            logger.error("Summarization error (attempt %d): %s", attempt, e, exc_info=True)
+            if attempt < max_retries:
+                time.sleep(30)
+                continue
             return None
 
-        result_text = _extract_json(result_text)
-        result = json.loads(result_text)
-        return _normalize_summary_result(result)
-
-    except json.JSONDecodeError as e:
-        logger.error("Failed to parse JSON from Claude: %s", e)
-        logger.debug("Claude response:\n%s", result_text)
-        return None
-    except Exception as e:
-        logger.error("Summarization error: %s", e, exc_info=True)
-        return None
+    return None
 
 
 def _call_claude(prompt: str) -> Optional[str]:
@@ -66,11 +80,14 @@ def _call_claude(prompt: str) -> Optional[str]:
     try:
         # Pass prompt directly via -p argument
         # macOS ARG_MAX ~ 1 MB, transcriptions are usually < 100 KB
+        # Unset CLAUDECODE to avoid "nested session" error when called from Claude Code
+        env = {k: v for k, v in __import__("os").environ.items() if k != "CLAUDECODE"}
         result = subprocess.run(
             ["claude", "-p", prompt],
             capture_output=True,
             text=True,
             timeout=300,  # 5 minutes to respond
+            env=env,
         )
 
         if result.returncode != 0:
@@ -145,7 +162,7 @@ CRITICAL INSTRUCTIONS:
 
 
 def _extract_json(text: str) -> str:
-    """Extract JSON from text, stripping markdown wrappers."""
+    """Extract JSON from text, stripping markdown wrappers and trailing garbage."""
     text = text.strip()
     if text.startswith("```json"):
         text = text[7:]
@@ -153,7 +170,34 @@ def _extract_json(text: str) -> str:
         text = text[3:]
     if text.endswith("```"):
         text = text[:-3]
-    return text.strip()
+    text = text.strip()
+
+    # Find the outermost JSON object by matching braces
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text[start:], start):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return text[start:]
 
 
 def _normalize_summary_result(result: Dict) -> Dict:

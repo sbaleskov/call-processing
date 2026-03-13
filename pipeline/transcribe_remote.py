@@ -2,28 +2,35 @@
 Remote audio transcription — offloads whisper to a server via SSH.
 
 Flow:
-  1. scp audio file → remote server
-  2. ssh: run worker.py (transcribe + optional diarize)
-  3. scp transcription text ← back
-  4. cleanup remote temp files
+  1. Kill any lingering worker from a previous run
+  2. scp audio file → remote server
+  3. ssh: start worker.py in background (nohup)
+  4. Poll for completion (check if output file exists)
+  5. scp transcription text ← back
+  6. Cleanup remote temp files
 """
 
 import logging
 import shlex
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Polling settings
+POLL_INTERVAL = 30       # seconds between checks
+MAX_POLL_TIME = 14400    # 240 minutes max wait (pyannote on CPU is slow)
 
 
 def transcribe_audio_remote(file_path: str, config) -> Optional[str]:
     """
     Transcribe an audio file on a remote server via SSH + scp.
 
-    Uses the same whisper/diarization settings from config, but executes
-    on the remote machine specified by REMOTE_HOST / REMOTE_USER.
+    Starts the worker in background (nohup) and polls for completion,
+    avoiding long-running SSH sessions that break on flaky connections.
 
     Returns transcription text or None on error.
     """
@@ -44,8 +51,19 @@ def transcribe_audio_remote(file_path: str, config) -> Optional[str]:
     worker_bin = f"{worker_dir}/worker.py"
     remote_audio = f"{work_dir}/{local_file.name}"
     remote_transcript = f"{work_dir}/{local_file.stem}_transcription.txt"
+    remote_done = f"{work_dir}/.done"
+    remote_log = f"{work_dir}/worker.log"
 
     try:
+        # Kill any lingering worker from a previous timed-out run
+        try:
+            _ssh(target, ssh_opts,
+                 "pkill -f 'worker.py /tmp/call-processing/' 2>/dev/null; sleep 1; "
+                 f"rm -f {work_dir}/*.mp3 {work_dir}/*.txt {work_dir}/.done {work_dir}/worker.log {work_dir}/run.sh",
+                 timeout=15)
+        except Exception:
+            pass  # non-critical
+
         # Ensure remote work dir exists
         _ssh(target, ssh_opts, f"mkdir -p {work_dir}")
 
@@ -53,12 +71,70 @@ def transcribe_audio_remote(file_path: str, config) -> Optional[str]:
         logger.info("Uploading %s to %s...", local_file.name, host)
         _scp_to(ssh_opts, str(local_file), f"{target}:{remote_audio}")
 
-        # Run transcription
-        logger.info("Remote transcription started on %s...", host)
+        # Build worker command and start in background via temp script
+        # (avoids nested quoting issues with filenames containing spaces/quotes)
         worker_cmd = _worker_command(
             python_bin, worker_bin, remote_audio, remote_transcript, config,
         )
-        _ssh(target, ssh_opts, worker_cmd, timeout=1800)  # 30 min max
+        remote_script = f"{work_dir}/run.sh"
+        script_content = (
+            f"#!/bin/sh\n"
+            f"{worker_cmd} > {shlex.quote(remote_log)} 2>&1\n"
+            f"touch {shlex.quote(remote_done)}\n"
+        )
+        _ssh(target, ssh_opts,
+             f"cat > {shlex.quote(remote_script)} << 'WORKER_EOF'\n"
+             f"{script_content}"
+             f"WORKER_EOF\n"
+             f"chmod +x {shlex.quote(remote_script)}",
+             timeout=15)
+
+        logger.info("Starting remote transcription on %s (background)...", host)
+        _ssh(target, ssh_opts,
+             f"nohup {shlex.quote(remote_script)} < /dev/null > /dev/null 2>&1 &",
+             timeout=15)
+
+        # Poll for completion
+        elapsed = 0
+        while elapsed < MAX_POLL_TIME:
+            time.sleep(POLL_INTERVAL)
+            elapsed += POLL_INTERVAL
+
+            try:
+                result = _ssh(target, ssh_opts,
+                              f"test -f {shlex.quote(remote_done)} && echo DONE || echo WAIT",
+                              timeout=15)
+                if "DONE" in result:
+                    logger.info("Transcription completed after %d min", elapsed // 60)
+                    break
+                # Check if worker is still running
+                ps_result = _ssh(target, ssh_opts,
+                                 "pgrep -f 'worker.py /tmp/call-processing/' > /dev/null 2>&1 "
+                                 "&& echo RUNNING || echo STOPPED",
+                                 timeout=15)
+                if "STOPPED" in ps_result and "DONE" not in result:
+                    # Worker died without producing .done — check log
+                    try:
+                        log_tail = _ssh(target, ssh_opts,
+                                        f"tail -5 {shlex.quote(remote_log)} 2>/dev/null",
+                                        timeout=10)
+                        logger.error("Worker died. Log tail: %s", log_tail.strip())
+                    except Exception:
+                        logger.error("Worker died, couldn't read log")
+                    return None
+            except Exception as e:
+                logger.warning("Poll failed (will retry): %s", e)
+                # VPS temporarily unreachable — just retry
+                continue
+        else:
+            logger.error("Transcription timed out after %d min", MAX_POLL_TIME // 60)
+            try:
+                _ssh(target, ssh_opts,
+                     "pkill -f 'worker.py /tmp/call-processing/' 2>/dev/null",
+                     timeout=10)
+            except Exception:
+                pass
+            return None
 
         # Download result
         logger.info("Downloading transcription...")
@@ -68,10 +144,12 @@ def transcribe_audio_remote(file_path: str, config) -> Optional[str]:
         transcription = Path(local_tmp).read_text(encoding="utf-8")
         Path(local_tmp).unlink(missing_ok=True)
 
-        # Cleanup remote files (non-critical — don't discard transcription on failure)
+        # Cleanup remote files (non-critical)
         try:
             _ssh(target, ssh_opts,
-                 f"rm -f {shlex.quote(remote_audio)} {shlex.quote(remote_transcript)}",
+                 f"rm -f {shlex.quote(remote_audio)} {shlex.quote(remote_transcript)} "
+                 f"{shlex.quote(remote_done)} {shlex.quote(remote_log)} "
+                 f"{shlex.quote(remote_script)}",
                  timeout=10)
         except Exception as e:
             logger.warning("Remote cleanup failed (non-critical): %s", e)
@@ -89,15 +167,24 @@ def transcribe_audio_remote(file_path: str, config) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _ssh_options(key_path: str = "") -> list:
-    opts = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"]
+    opts = [
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=4",
+    ]
     if key_path:
         opts.extend(["-i", key_path])
     return opts
 
 
 def _worker_command(python_bin, worker_bin, audio_path, output_path, config) -> str:
-    """Build the shell command to run worker.py on the remote server."""
+    """Build the shell command to run worker.py on the remote server.
+
+    Uses nice + thread limit to keep VPS responsive during transcription.
+    """
     parts = [
+        "nice", "-n", "15",
         shlex.quote(python_bin),
         shlex.quote(worker_bin),
         shlex.quote(audio_path),
@@ -105,16 +192,25 @@ def _worker_command(python_bin, worker_bin, audio_path, output_path, config) -> 
         "--model", shlex.quote(config.whisper_model_size),
         "--language", shlex.quote(config.language),
         "--compute-type", shlex.quote(config.whisper_compute_type),
-        "--threads", str(config.cpu_threads),
+        "--threads", "2",
     ]
     device = getattr(config, "whisper_device", "cpu")
     if device != "cpu":
         parts.extend(["--device", shlex.quote(device)])
+    if getattr(config, "vad_filter", True):
+        parts.append("--vad-filter")
+    else:
+        parts.append("--no-vad-filter")
     if getattr(config, "diarize", False):
         parts.append("--diarize")
         num = getattr(config, "num_speakers", 0)
         if num > 0:
             parts.extend(["--num-speakers", str(num)])
+        backend = getattr(config, "diarize_backend", "auto")
+        parts.extend(["--diarize-backend", shlex.quote(backend)])
+        hf_token = getattr(config, "hf_token", "")
+        if hf_token:
+            parts.extend(["--hf-token", shlex.quote(hf_token)])
     return " ".join(parts)
 
 
@@ -128,19 +224,33 @@ def _ssh(target, opts, command, timeout=60):
     return result.stdout
 
 
-def _scp_to(opts, local_path, remote_path):
-    result = subprocess.run(
-        ["scp"] + opts + [local_path, remote_path],
-        capture_output=True, text=True, timeout=600,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"SCP upload failed: {result.stderr.strip()}")
+def _scp_to(opts, local_path, remote_path, retries=3):
+    for attempt in range(1, retries + 1):
+        result = subprocess.run(
+            ["scp"] + opts + [local_path, remote_path],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode == 0:
+            return
+        err = result.stderr.strip()
+        if attempt < retries:
+            logger.warning("SCP upload attempt %d/%d failed: %s", attempt, retries, err)
+            time.sleep(5 * attempt)
+        else:
+            raise RuntimeError(f"SCP upload failed after {retries} attempts: {err}")
 
 
-def _scp_from(opts, remote_path, local_path):
-    result = subprocess.run(
-        ["scp"] + opts + [remote_path, local_path],
-        capture_output=True, text=True, timeout=600,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"SCP download failed: {result.stderr.strip()}")
+def _scp_from(opts, remote_path, local_path, retries=3):
+    for attempt in range(1, retries + 1):
+        result = subprocess.run(
+            ["scp"] + opts + [remote_path, local_path],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode == 0:
+            return
+        err = result.stderr.strip()
+        if attempt < retries:
+            logger.warning("SCP download attempt %d/%d failed: %s", attempt, retries, err)
+            time.sleep(5 * attempt)
+        else:
+            raise RuntimeError(f"SCP download failed after {retries} attempts: {err}")

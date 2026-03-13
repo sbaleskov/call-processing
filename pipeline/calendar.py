@@ -11,7 +11,10 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-import caldav
+try:
+    import caldav
+except ImportError:
+    caldav = None
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,10 @@ def find_event_name(
     Returns:
         Event title or None if not found.
     """
+    if caldav is None:
+        logger.warning("caldav module not installed, skipping calendar lookup")
+        return None
+
     if not caldav_url or not caldav_username or not caldav_password:
         logger.warning("CalDAV credentials not configured, skipping calendar lookup")
         return None

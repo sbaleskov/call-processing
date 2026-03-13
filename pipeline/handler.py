@@ -230,6 +230,31 @@ class AudioFileHandler(FileSystemEventHandler):
         summ = directory / f"{stem}_summary.md"
         return trans.exists() and summ.exists()
 
+    MAX_FAILURES = 3
+
+    @staticmethod
+    def _get_failure_count(file_path: Path) -> int:
+        """Read failure count from .failed marker file."""
+        marker = file_path.parent / f"{file_path.stem}.failed"
+        if marker.exists():
+            try:
+                return int(marker.read_text().strip())
+            except (ValueError, OSError):
+                return 1
+        return 0
+
+    @staticmethod
+    def _record_failure(file_path: Path):
+        """Increment failure count in .failed marker file."""
+        marker = file_path.parent / f"{file_path.stem}.failed"
+        count = 0
+        if marker.exists():
+            try:
+                count = int(marker.read_text().strip())
+            except (ValueError, OSError):
+                count = 0
+        marker.write_text(str(count + 1))
+
     # ──────────────────────────── main pipeline ──────────────────────────────
 
     def process_file(self, file_path: Path):
@@ -246,21 +271,36 @@ class AudioFileHandler(FileSystemEventHandler):
         self.processing_lock[file_str] = True
 
         try:
+            # Check failure count — skip files that failed too many times
+            failures = self._get_failure_count(file_path)
+            if failures >= self.MAX_FAILURES:
+                logger.warning(
+                    "Skipping %s — failed %d times (max %d). Delete .failed file to retry.",
+                    file_path.name, failures, self.MAX_FAILURES,
+                )
+                return
+
             logger.info("Starting file processing: %s", file_path.name)
 
             # Step 1: Rename
             logger.info("Step 1: Renaming file...")
             file_path = self._rename_audio_file(file_path)
 
-            # Step 2: Transcribe
-            logger.info("Step 2: Transcribing audio...")
-            transcription = transcribe_audio(str(file_path), self.config)
+            # Step 2: Transcribe (skip if transcription already exists)
+            transcription_file = file_path.parent / f"{file_path.stem}_transcription.txt"
+            if transcription_file.exists() and transcription_file.stat().st_size > 0:
+                logger.info("Step 2: Transcription already exists, skipping...")
+                transcription = transcription_file.read_text(encoding="utf-8")
+            else:
+                logger.info("Step 2: Transcribing audio...")
+                transcription = transcribe_audio(str(file_path), self.config)
 
-            if not transcription:
-                logger.error("Failed to get transcription for %s", file_path.name)
-                return
+                if not transcription:
+                    logger.error("Failed to get transcription for %s", file_path.name)
+                    self._record_failure(file_path)
+                    return
 
-            transcription_file = self._save_transcription(file_path, transcription)
+                transcription_file = self._save_transcription(file_path, transcription)
 
             # Step 3: Summarize + classify action items
             logger.info("Step 3: Summarization and action item classification...")
@@ -269,6 +309,7 @@ class AudioFileHandler(FileSystemEventHandler):
 
             if not summary:
                 logger.error("Failed to create summary for %s", file_path.name)
+                self._record_failure(file_path)
                 return
 
             summary_file = self._save_summary(file_path, summary, transcription_file)
@@ -277,7 +318,11 @@ class AudioFileHandler(FileSystemEventHandler):
             logger.info("   Transcription: %s", transcription_file)
             logger.info("   Summary: %s", summary_file)
 
-            # Step 4: Add action items to inbox + YouTrack
+            # Step 4: YouTrack subtasks + summary comment
+            if self.config.youtrack_enabled and self.config.youtrack_token:
+                self._create_youtrack_tasks_standalone(summary, file_path)
+
+            # Step 5: Add action items to inbox (requires local file access)
             if self.config.inbox_enabled:
                 self._send_to_inbox_and_youtrack(summary, file_path)
 
@@ -287,6 +332,7 @@ class AudioFileHandler(FileSystemEventHandler):
 
         except Exception as e:
             logger.error("Error processing file %s: %s", file_path.name, e, exc_info=True)
+            self._record_failure(file_path)
         finally:
             if file_str in self.processing_lock:
                 del self.processing_lock[file_str]
@@ -389,6 +435,45 @@ class AudioFileHandler(FileSystemEventHandler):
             lines.extend(["", "## Participants", ", ".join(participants)])
 
         return "\n".join(lines)
+
+    # ──────────────────────────── youtrack standalone ────────────────────────
+
+    def _create_youtrack_tasks_standalone(self, summary: Dict, file_path: Path):
+        """Create YT subtasks for action items (without inbox dependency)."""
+        action_items = summary.get("action_items", [])
+        if not action_items:
+            logger.info("No action items for YouTrack")
+            return
+
+        yt = YouTrackClient(
+            self.config.youtrack_url,
+            self.config.youtrack_token,
+            self.config.youtrack_project,
+        )
+
+        date_str = (
+            file_path.stem.split("_")[0]
+            if "_" in file_path.stem
+            else datetime.now().strftime("%Y-%m-%d")
+        )
+
+        for item in action_items:
+            description = item.get("description", "")
+            parent_task = item.get("parent_task", "").strip()
+
+            # Skip __NEW__ items (no YT parent to attach to)
+            if parent_task.startswith("__NEW__:"):
+                continue
+
+            yt_summary = f"{parent_task} // {description}" if parent_task else description
+            yt_description = f"From call on {date_str}"
+
+            try:
+                issue_id = yt.create_issue(yt_summary, yt_description)
+                if issue_id:
+                    logger.info("Created YT issue %s: %s", issue_id, description[:60])
+            except Exception as e:
+                logger.warning("Failed to create YT issue: %s", e)
 
     # ──────────────────────────── inbox integration ──────────────────────────
 
