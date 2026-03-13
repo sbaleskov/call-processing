@@ -47,9 +47,9 @@ SCHEDULE_TIME=23:00              # run time (daily mode)
 
 ### Infra
 
-- Removed old nightly whisper cron (`/opt/automation/whisper/transcribe.py`) from VPS
-- Installed `ffmpeg` on VPS (was missing, needed for non-WAV formats)
-- Deployed `worker.py` to VPS at `/opt/call-processing/` with dedicated venv
+- Removed old nightly whisper cron from the server
+- Installed `ffmpeg` on the server (was missing, needed for non-WAV formats)
+- Deployed `worker.py` to the server with dedicated venv
 
 ### Updated docs
 
